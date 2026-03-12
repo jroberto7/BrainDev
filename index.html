@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="pt-BR" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0ea5e9" />
+    <title>BrainDev — Segundo cérebro para devs</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body data-view="login">
+    <div class="login" id="loginRoot" aria-label="Tela de login">
+      <form class="login__card" id="loginForm">
+        <div class="login__brand">
+          <div class="brand__logo" aria-hidden="true">BD</div>
+          <div>
+            <div class="brand__name">BrainDev</div>
+            <div class="brand__tag">Painel pessoal</div>
+          </div>
+        </div>
+
+        <h1 class="login__title">Entrar</h1>
+        <p class="login__subtitle">Digite seu e-mail e senha para acessar o dashboard.</p>
+
+        <div class="field">
+          <label for="loginEmail">E-mail</label>
+          <input
+            class="input"
+            id="loginEmail"
+            name="email"
+            type="email"
+            required
+            autocomplete="email"
+            placeholder="seu@email.com"
+          />
+        </div>
+
+        <div class="field">
+          <label for="loginPassword">Senha</label>
+          <input
+            class="input"
+            id="loginPassword"
+            name="password"
+            type="password"
+            required
+            autocomplete="current-password"
+            placeholder="••••••"
+          />
+        </div>
+
+        <div id="loginError" class="login__error" hidden>Email ou senha incorretos.</div>
+
+        <button class="btn btn--primary login__submit" type="submit">Entrar</button>
+        <div class="muted login__hint">
+          Recomendado: abrir via <span class="mono">http://localhost</span> (ex: Live Server) para autenticação do dispositivo.
+        </div>
+      </form>
+    </div>
+
+    <div class="app" id="app">
+      <aside class="sidebar" id="sidebar" aria-label="Menu lateral">
+        <div class="sidebar__brand">
+          <button class="icon-btn sidebar__toggle" id="sidebarToggle" aria-label="Abrir/fechar menu">
+            <span aria-hidden="true">☰</span>
+          </button>
+          <div class="brand" role="button" tabindex="0" id="goHome">
+            <div class="brand__logo" aria-hidden="true">BD</div>
+            <div class="brand__text">
+              <div class="brand__name">BrainDev</div>
+              <div class="brand__tag">Seu segundo cérebro</div>
+            </div>
+          </div>
+        </div>
+
+        <nav class="nav" id="nav" aria-label="Categorias"></nav>
+
+        <div class="sidebar__footer">
+          <button class="btn btn--ghost" id="exportBtn" type="button">Exportar</button>
+          <label class="btn btn--ghost file-btn" title="Importar backup JSON">
+            Importar
+            <input type="file" id="importFile" accept="application/json" hidden />
+          </label>
+        </div>
+      </aside>
+
+      <div class="content">
+        <header class="topbar">
+          <div class="topbar__left">
+            <button class="icon-btn mobile-menu-btn" id="mobileMenuBtn" aria-label="Menu">
+              <span aria-hidden="true">☰</span>
+            </button>
+
+            <div class="search" id="searchBox">
+              <input
+                id="globalSearch"
+                type="search"
+                placeholder="Buscar em tudo… (prompts, clientes, rendas, programas, projetos, senhas)"
+                autocomplete="off"
+                aria-label="Busca global"
+              />
+              <div class="search__results" id="searchResults" hidden></div>
+            </div>
+          </div>
+
+          <div class="topbar__right">
+            <div class="user-pill" id="userPill" hidden></div>
+            <button class="btn btn--ghost" id="logoutBtn" type="button" hidden>Sair</button>
+            <button class="icon-btn" id="themeToggle" aria-label="Alternar tema" title="Modo escuro">
+              <span aria-hidden="true">◐</span>
+            </button>
+            <button class="btn btn--primary" id="quickAddBtn" type="button">➕ Novo</button>
+          </div>
+        </header>
+
+        <main class="main" id="main" tabindex="-1"></main>
+      </div>
+    </div>
+
+    <div class="modal-root" id="modalRoot" aria-live="polite"></div>
+    <div class="toast-root" id="toastRoot" aria-live="polite" aria-atomic="true"></div>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>
