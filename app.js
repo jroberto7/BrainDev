@@ -9,6 +9,7 @@
 
   const STORAGE_PREFIX = "braindev:v3";
   const SESSION_KEY = "braindev:session";
+  const SESSION_EMAIL_KEY = "braindev:session:email";
   const LEGACY_STORAGE_KEY = "braindev:v1";
 
   // -------------------------
@@ -35,10 +36,22 @@
   };
 
   let activeUserId = "";
+  let activeUserEmail = "";
   let storageKey = "";
   /** @type {Array<{id:string,label:string,icon:string,desc:string}>} */
   let sections = [];
   let dashboardEventsBound = false;
+  let cloudState = createCloudState();
+  const LOCAL_MODAL_ACTIONS = new Set([
+    "clientTab",
+    "addClientSocialOther",
+    "editClientSocialOther",
+    "copyClientSocialPass",
+    "copyClientOtherPass",
+    "deleteClientSocialOther",
+    "editIncomeDirect",
+    "deleteIncomeDirect",
+  ]);
 
   /** @type {ReturnType<typeof normalizeDB>} */
   let db = normalizeDB(defaultDB());
@@ -57,6 +70,7 @@
     mobileSidebarOpen: false,
     revealMap: new Map(),
     authUntil: 0,
+    afterClientSaveSection: "",
   };
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -68,6 +82,8 @@
     loginRoot: $("#loginRoot"),
     loginForm: $("#loginForm"),
     loginError: $("#loginError"),
+    loginSubmit: $("#loginSubmit"),
+    syncStatus: $("#syncStatus"),
     userPill: $("#userPill"),
     logoutBtn: $("#logoutBtn"),
     nav: $("#nav"),
@@ -91,6 +107,7 @@
 
   function boot() {
     bindLoginEvents();
+    updateSyncStatus("Modo local", "local");
     showLogin();
   }
 
@@ -112,9 +129,9 @@
       },
       {
         id: "income",
-        label: isEdu ? "Renda" : "Rendas",
+        label: "Renda",
         icon: "💰",
-        desc: isEdu ? "Registro de pagamentos por aluno." : "Agenda de trabalho (dia, horários e atividade).",
+        desc: "Renda automática com base nos clientes ativos (sem inserção manual).",
       },
       { id: "programs", label: "Programas", icon: "🧩", desc: "Softwares utilizados no trabalho." },
       { id: "tools", label: "Ferramentas", icon: "🧰", desc: "Ferramentas online úteis com link." },
@@ -129,6 +146,7 @@
 
   function showLogin() {
     activeUserId = "";
+    activeUserEmail = "";
     storageKey = "";
     sections = [];
 
@@ -142,6 +160,13 @@
     uiState.revealMap.clear();
     uiState.authUntil = 0;
 
+    teardownCloudSync({ signOutUser: true });
+    localStorage.removeItem(SESSION_KEY);
+    localStorage.removeItem(SESSION_EMAIL_KEY);
+
+    el.nav.innerHTML = "";
+    el.main.innerHTML = "";
+    updateSyncStatus("Modo local", "local");
     el.userPill.hidden = true;
     el.logoutBtn.hidden = true;
     el.body.dataset.view = "login";
@@ -154,13 +179,15 @@
     if (el.loginError) {
       el.loginError.hidden = true;
     }
+    setLoginPending(false);
   }
 
-  async function startSession(userId) {
+  async function startSession(userId, options = {}) {
     const u = USERS[userId];
     if (!u) return toast("Usuário inválido", "danger");
 
     activeUserId = u.id;
+    activeUserEmail = String(options.email || "").trim().toLowerCase();
     storageKey = storageKeyForUser(activeUserId);
     db = loadDBForUser(activeUserId);
     sections = buildSectionsForUser(activeUserId);
@@ -178,20 +205,29 @@
     el.body.dataset.view = "app";
 
     localStorage.setItem(SESSION_KEY, activeUserId);
-
-    const ok = await ensureDeviceAuth("entrar no dashboard");
-    if (!ok) {
-      showLogin();
-      return;
+    if (activeUserEmail) {
+      localStorage.setItem(SESSION_EMAIL_KEY, activeUserEmail);
     }
 
     renderNav();
     navigate(db.settings?.lastSection || sections[0]?.id || "prompts");
     toast(u.welcome, "success");
+
+    if (!options.skipCloud) {
+      connectCloudSync({
+        email: activeUserEmail,
+        authUser: options.authUser || null,
+      }).catch((err) => {
+        console.warn("Falha ao conectar com o Firebase", err);
+        updateSyncStatus("Modo local", "warning");
+      });
+    } else {
+      updateSyncStatus("Modo local", "local");
+    }
   }
 
   function bindLoginEvents() {
-    el.loginForm?.addEventListener("submit", (e) => {
+    el.loginForm?.addEventListener("submit", async (e) => {
       e.preventDefault();
 
       const fd = new FormData(el.loginForm);
@@ -200,20 +236,51 @@
 
       // Esconde erro anterior
       if (el.loginError) el.loginError.hidden = true;
+      setLoginPending(true);
 
-      const match = CREDENTIALS[email];
+      try {
+        const match = CREDENTIALS[email];
 
-      if (!match || match.password !== password) {
-        // Mostra mensagem de erro inline
-        if (el.loginError) {
-          el.loginError.hidden = false;
-        } else {
-          toast("Email ou senha incorretos.", "danger");
+        if (!match) {
+          if (el.loginError) {
+            el.loginError.hidden = false;
+          } else {
+            toast("Email ou senha incorretos.", "danger");
+          }
+          return;
         }
-        return;
-      }
 
-      startSession(match.userId);
+        let authUser = null;
+
+        if (isFirebaseConfigured()) {
+          try {
+            authUser = await signInFirebaseUser(email, password);
+          } catch (err) {
+            console.warn("Falha no login do Firebase, usando fallback local.", err);
+            if (match.password !== password) {
+              if (el.loginError) {
+                el.loginError.hidden = false;
+              } else {
+                toast("Email ou senha incorretos.", "danger");
+              }
+              return;
+            }
+
+            toast("Firebase indisponivel agora. Entrando em modo local.", "warning");
+          }
+        } else if (match.password !== password) {
+          if (el.loginError) {
+            el.loginError.hidden = false;
+          } else {
+            toast("Email ou senha incorretos.", "danger");
+          }
+          return;
+        }
+
+        await startSession(match.userId, { email, authUser, skipCloud: !authUser });
+      } finally {
+        setLoginPending(false);
+      }
     });
   }
 
@@ -236,21 +303,40 @@
     el.quickAddBtn.addEventListener("click", () => openQuickAdd());
 
     el.nav.addEventListener("click", (e) => {
-      const btn = e.target.closest("[data-section]");
-      if (!btn) return;
-      navigate(btn.dataset.section);
+      const navBtn = e.target.closest("[data-section]:not([data-action])");
+      if (!navBtn || !el.nav.contains(navBtn)) return;
+      e.preventDefault();
+      try {
+        navigate(navBtn.dataset.section);
+      } catch (err) {
+        handleUiError("abrir a secao", err);
+      }
     });
 
-    el.main.addEventListener("click", (e) => {
+    const routeActionClick = (e, root) => {
       const actionEl = e.target.closest("[data-action]");
-      if (!actionEl) return;
-      handleAction({
-        action: actionEl.dataset.action,
-        id: actionEl.dataset.id || "",
-        section: actionEl.dataset.section || uiState.section,
-        target: actionEl,
-      });
-    });
+      if (!actionEl || !root.contains(actionEl)) return;
+
+      const action = String(actionEl.dataset.action || "").trim();
+      if (!action || LOCAL_MODAL_ACTIONS.has(action)) return;
+
+      e.preventDefault();
+
+      try {
+        handleAction({
+          action,
+          id: actionEl.dataset.id || "",
+          section: actionEl.dataset.section || uiState.section,
+          target: actionEl,
+        });
+      } catch (err) {
+        handleUiError(`executar a acao "${action}"`, err);
+      }
+    };
+
+    el.main.addEventListener("click", (e) => routeActionClick(e, el.main));
+    el.modalRoot.addEventListener("click", (e) => routeActionClick(e, el.modalRoot));
+    el.searchResults.addEventListener("click", (e) => routeActionClick(e, el.searchResults));
 
     el.main.addEventListener("change", (e) => {
       const select = e.target.closest("[data-filter]");
@@ -259,18 +345,12 @@
       renderSection();
     });
 
-    el.modalRoot.addEventListener("click", (e) => {
-      const actionEl = e.target.closest("[data-action]");
-      if (!actionEl) return;
-      const action = actionEl.dataset.action;
-      if (action === "closeModal" || action === "copyField" || action === "openLink") return;
-      if (action === "toggleReveal" && !actionEl.dataset.section) return;
-      handleAction({
-        action,
-        id: actionEl.dataset.id || "",
-        section: actionEl.dataset.section || uiState.section,
-        target: actionEl,
-      });
+    el.modalRoot.addEventListener("submit", (e) => {
+      if (e.defaultPrevented) return;
+      const form = e.target.closest("form");
+      if (!form) return;
+      e.preventDefault();
+      toast(`Formulario sem acao configurada: ${form.id || "sem-id"}`, "danger");
     });
 
     // Busca global
@@ -325,6 +405,41 @@
     el.sidebar.classList.toggle("is-open", next);
   }
 
+  function handleUiError(context, err) {
+    console.error(`Falha ao ${context}`, err);
+    toast(`Falha ao ${context}.`, "danger");
+  }
+
+  function bindActionButtons(root, options = {}) {
+    if (!root) return;
+
+    const skipLocalActions = Boolean(options.skipLocalActions);
+    $$("[data-action]", root).forEach((node) => {
+      if (node.dataset.actionBound === "1") return;
+      node.dataset.actionBound = "1";
+
+      node.addEventListener("click", (e) => {
+        const action = String(node.dataset.action || "").trim();
+        if (!action) return;
+        if (skipLocalActions && LOCAL_MODAL_ACTIONS.has(action)) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        try {
+          handleAction({
+            action,
+            id: node.dataset.id || "",
+            section: node.dataset.section || uiState.section,
+            target: node,
+          });
+        } catch (err) {
+          handleUiError(`executar a acao "${action}"`, err);
+        }
+      });
+    });
+  }
+
   function applyTheme(theme) {
     el.html.dataset.theme = theme === "dark" ? "dark" : "light";
   }
@@ -362,13 +477,21 @@
   }
 
   function renderSection() {
-    const section = getSections().find((s) => s.id === uiState.section) || getSections()[0];
+    ensureFinanceCurrentMonth();
+    const availableSections = getSections();
+    if (availableSections.length === 0) {
+      el.main.innerHTML = emptyState("Nenhuma secao disponivel.", "Faca login novamente para carregar o painel.");
+      return;
+    }
+
+    const section = availableSections.find((s) => s.id === uiState.section) || availableSections[0];
     el.main.innerHTML = `
       <div class="section">
         ${renderSectionHead(section)}
         ${renderSectionBody(section.id)}
       </div>
     `;
+    bindActionButtons(el.main);
     renderNav();
   }
 
@@ -380,7 +503,7 @@
           <p>${escapeHTML(section.desc)}</p>
         </div>
         <div class="section__actions">
-          ${renderSectionFilters(section.id)}
+          ${section.id === "income" ? "" : renderSectionFilters(section.id)}
           ${renderSectionActions(section.id)}
         </div>
       </div>
@@ -389,10 +512,17 @@
 
   function renderSectionActions(sectionId) {
     const isEduSection = activeUserId === "eduarda";
+    if (sectionId === "income") {
+      return `
+        <button class="btn btn--primary" type="button" data-action="incomeAddClient">
+          ➕ Cliente
+        </button>
+      `;
+    }
     const labels = {
       prompts: "➕ Adicionar Prompt",
       clients: isEduSection ? "➕ Adicionar Aluno" : "➕ Adicionar Cliente",
-      income: isEduSection ? "➕ Pagamento extra" : "➕ Adicionar Renda",
+      income: "➕ Cliente",
       programs: "➕ Adicionar Programa",
       projects: "➕ Adicionar Projeto",
       tools: "➕ Adicionar Ferramenta",
@@ -542,10 +672,86 @@
   }
 
   function handleAction({ action, id, section, target }) {
+    if (action === "closeModal") return closeModal();
     if (action === "add") return openAdd(section);
     if (action === "view") return openView(section, id);
     if (action === "edit") return openEdit(section, id);
     if (action === "delete") return deleteItem(section, id);
+    if (action === "quickAddGo") {
+      closeModal();
+      navigate(section);
+      openAdd(section);
+      return;
+    }
+    if (action === "jumpTo") {
+      el.searchResults.hidden = true;
+      el.globalSearch.value = "";
+      el.globalSearch.blur();
+      navigate(section);
+      setTimeout(() => openView(section, id), 0);
+      return;
+    }
+
+    if (action === "financeSettings") return openFinanceSettingsModal();
+    if (action === "financeAddExpense") return openFinanceExpenseModal();
+    if (action === "financeEditExpense") {
+      const fin = getFinanceiro();
+      const g = (fin.gastos || []).find((x) => x.id === id);
+      if (g) openFinanceExpenseModal(g);
+      return;
+    }
+    if (action === "financeDeleteExpense") {
+      const fin = getFinanceiro();
+      const g = (fin.gastos || []).find((x) => x.id === id);
+      if (!g) return;
+      confirmDelete("Excluir gasto?", "Essa acao nao pode ser desfeita.", () => {
+        fin.gastos = (fin.gastos || []).filter((x) => x.id !== id);
+        db.financeiro = fin;
+        saveDB({ immediateCloud: true });
+        renderSection();
+        toast("Gasto excluido", "success");
+      });
+      return;
+    }
+    if (action === "financeTogglePaid") {
+      const fin = getFinanceiro();
+      const g = (fin.gastos || []).find((x) => x.id === id);
+      if (!g) return;
+      g.pago = Boolean(target?.checked);
+      db.financeiro = fin;
+      saveDB();
+      renderSection();
+      return;
+    }
+
+    if (action === "incomeAddClient") {
+      uiState.afterClientSaveSection = "income";
+      navigate("clients");
+      openClientForm();
+      return;
+    }
+
+    if (action === "toggleClientActive") {
+      const idx = db.clients.findIndex((c) => c.id === id);
+      if (idx < 0) return;
+      db.clients[idx].ativo = !Boolean(db.clients[idx].ativo);
+      db.clients[idx].updatedAt = Date.now();
+      saveDB();
+      renderSection();
+      toast(db.clients[idx].ativo ? "Cliente ativado" : "Cliente desativado", "success");
+      return;
+    }
+
+    if (action === "editClientFromIncome") {
+      const c = db.clients.find((x) => x.id === id);
+      if (c) openClientForm(c);
+      return;
+    }
+
+    if (action === "deleteClientFromIncome") {
+      deleteItem("clients", id);
+      return;
+    }
 
     if (action === "copyPrompt") {
       const p = db.prompts.items.find((x) => x.id === id);
@@ -620,7 +826,7 @@
     if (action === "deleteIncomeExtra") {
       confirmDelete("Excluir renda extra?", "Essa ação não pode ser desfeita.", () => {
         db.incomeExtras = db.incomeExtras.filter((x) => x.id !== id);
-        saveDB(); renderSection(); toast("Renda extra excluída", "success");
+        saveDB({ immediateCloud: true }); renderSection(); toast("Renda extra excluída", "success");
       });
       return;
     }
@@ -706,15 +912,27 @@
     if (action === "openLink") {
       const url = target?.dataset.payload || "";
       if (url) window.open(url, "_blank", "noopener,noreferrer");
+      return;
     }
+    if (action === "clientTab") return;
+    if (action === "addClientSocialOther") return;
+    if (action === "editClientSocialOther") return;
+    if (action === "copyClientSocialPass") return;
+    if (action === "copyClientOtherPass") return;
+    if (action === "deleteClientSocialOther") return;
+    if (action === "editIncomeDirect") return;
+    if (action === "deleteIncomeDirect") return;
+
+    toast(`Botao sem acao configurada: ${action}`, "warning");
   }
 
   function openAdd(section) {
     if (section === "prompts") return openPromptForm();
     if (section === "clients") return openClientForm();
     if (section === "income") {
-      if (activeUserId === "eduarda") return openIncomeExtraForm();
-      return openIncomeForm();
+      uiState.afterClientSaveSection = uiState.afterClientSaveSection || "income";
+      navigate("clients");
+      return openClientForm();
     }
     if (section === "programs") return openProgramForm();
     if (section === "projects") return openProjectForm();
@@ -770,11 +988,317 @@
       if (sectionId === "vault") db.vault = db.vault.filter((x) => x.id !== id);
       if (sectionId === "passwords") db.passwords = db.passwords.filter((x) => x.id !== id);
 
-      saveDB();
+      saveDB({ immediateCloud: true });
       closeModal();
       renderSection();
       toast("Item excluído", "success");
     });
+  }
+
+  function createCloudState() {
+    return {
+      settings: null,
+      app: null,
+      auth: null,
+      firestore: null,
+      authApi: null,
+      dbApi: null,
+      docRef: null,
+      unsubscribe: null,
+      saveTimer: 0,
+      connected: false,
+      applyingRemote: false,
+      lastLocalRevision: "",
+      lastAppliedRevision: "",
+    };
+  }
+
+  function setLoginPending(pending) {
+    if (!el.loginSubmit) return;
+    el.loginSubmit.disabled = Boolean(pending);
+    el.loginSubmit.textContent = pending ? "Entrando..." : "Entrar";
+  }
+
+  function updateSyncStatus(message, tone = "local") {
+    if (!el.syncStatus) return;
+
+    const text = String(message || "").trim() || "Modo local";
+    el.syncStatus.hidden = false;
+    el.syncStatus.textContent = text;
+    el.syncStatus.dataset.state = tone;
+  }
+
+  function getFirebaseSettings() {
+    const raw = window.BRAINDEV_FIREBASE && typeof window.BRAINDEV_FIREBASE === "object" ? window.BRAINDEV_FIREBASE : {};
+    const config = raw.config && typeof raw.config === "object" ? raw.config : {};
+    const required = ["apiKey", "authDomain", "projectId", "appId"];
+    const hasConfig = required.every((key) => String(config[key] || "").trim());
+
+    return {
+      enabled: Boolean(raw.enabled) && hasConfig,
+      config,
+      collection: String(raw.collection || "braindevUsers"),
+      sdkVersion: String(raw.sdkVersion || "12.7.0"),
+    };
+  }
+
+  function isFirebaseConfigured() {
+    return getFirebaseSettings().enabled;
+  }
+
+  async function ensureFirebaseRuntime() {
+    const settings = getFirebaseSettings();
+    if (!settings.enabled) return null;
+
+    if (cloudState.app && cloudState.auth && cloudState.firestore && cloudState.authApi && cloudState.dbApi) {
+      cloudState.settings = settings;
+      return cloudState;
+    }
+
+    const baseUrl = `https://www.gstatic.com/firebasejs/${settings.sdkVersion}`;
+    const [appApi, authApi, dbApi] = await Promise.all([
+      import(`${baseUrl}/firebase-app.js`),
+      import(`${baseUrl}/firebase-auth.js`),
+      import(`${baseUrl}/firebase-firestore.js`),
+    ]);
+
+    const existingApp =
+      appApi.getApps().find((candidate) => candidate.options?.projectId === settings.config.projectId) || null;
+    const app = existingApp || appApi.initializeApp(settings.config, `braindev-${settings.config.projectId}`);
+    const auth = authApi.getAuth(app);
+    await authApi.setPersistence(auth, authApi.browserLocalPersistence);
+
+    cloudState.settings = settings;
+    cloudState.app = app;
+    cloudState.auth = auth;
+    cloudState.firestore = dbApi.getFirestore(app);
+    cloudState.authApi = authApi;
+    cloudState.dbApi = dbApi;
+
+    return cloudState;
+  }
+
+  async function signInFirebaseUser(email, password) {
+    const runtime = await ensureFirebaseRuntime();
+    if (!runtime) return null;
+    const result = await runtime.authApi.signInWithEmailAndPassword(runtime.auth, email, password);
+    return result.user || null;
+  }
+
+  async function connectCloudSync({ email = "", authUser = null } = {}) {
+    teardownCloudSync();
+
+    if (!isFirebaseConfigured()) {
+      updateSyncStatus("Modo local", "local");
+      return;
+    }
+
+    updateSyncStatus("Conectando Firebase...", "syncing");
+
+    const runtime = await ensureFirebaseRuntime();
+    if (!runtime) {
+      updateSyncStatus("Modo local", "local");
+      return;
+    }
+
+    const user = authUser || runtime.auth.currentUser;
+    if (!user) {
+      updateSyncStatus("Firebase sem login", "warning");
+      return;
+    }
+
+    cloudState.docRef = runtime.dbApi.doc(runtime.firestore, runtime.settings.collection, user.uid);
+    cloudState.connected = true;
+
+    try {
+      const initialSnapshot = await runtime.dbApi.getDoc(cloudState.docRef);
+      if (initialSnapshot.exists()) {
+        const remotePayload = initialSnapshot.data();
+        const remoteData = remotePayload?.data && typeof remotePayload.data === "object" ? remotePayload.data : remotePayload;
+        const localStats = getDbStats(db);
+        const remoteStats = getDbStats(remoteData);
+        const remoteUpdatedAt = Math.max(Number(remotePayload?.updatedAt || 0), remoteStats.updatedAt);
+
+        if (remoteStats.count > 0 && (localStats.count === 0 || remoteUpdatedAt > localStats.updatedAt)) {
+          applyCloudPayload(remotePayload, { preserveSection: false });
+          updateSyncStatus("Sincronizado com Firebase", "cloud");
+        } else {
+          await persistCloudSaveNow();
+          updateSyncStatus("Firebase atualizado", "cloud");
+        }
+      } else {
+        await persistCloudSaveNow();
+        updateSyncStatus("Firebase pronto", "cloud");
+      }
+    } catch (err) {
+      fallbackToLocalMode("Firebase indisponivel. Salvando so neste aparelho.", err);
+      return;
+    }
+
+    cloudState.unsubscribe = runtime.dbApi.onSnapshot(
+      cloudState.docRef,
+      (snapshot) => {
+        if (!snapshot.exists()) return;
+        if (snapshot.metadata?.hasPendingWrites) {
+          updateSyncStatus("Sincronizando...", "syncing");
+          return;
+        }
+
+        applyCloudPayload(snapshot.data(), { preserveSection: true });
+        updateSyncStatus("Sincronizado com Firebase", "cloud");
+      },
+      (err) => {
+        fallbackToLocalMode("Modo local. Erro de sincronizacao no Firebase.", err);
+      },
+    );
+
+    if (email && !activeUserEmail) activeUserEmail = String(email).trim().toLowerCase();
+  }
+
+  function teardownCloudSync(options = {}) {
+    clearTimeout(cloudState.saveTimer);
+    cloudState.saveTimer = 0;
+
+    if (typeof cloudState.unsubscribe === "function") {
+      cloudState.unsubscribe();
+    }
+
+    cloudState.unsubscribe = null;
+    cloudState.docRef = null;
+    cloudState.connected = false;
+    cloudState.applyingRemote = false;
+    cloudState.lastLocalRevision = "";
+    cloudState.lastAppliedRevision = "";
+
+    if (options.signOutUser && cloudState.auth && cloudState.auth.currentUser && cloudState.authApi?.signOut) {
+      cloudState.authApi.signOut(cloudState.auth).catch((err) => {
+        console.warn("Falha ao encerrar a sessao do Firebase", err);
+      });
+    }
+  }
+
+  function fallbackToLocalMode(message, err) {
+    if (err) console.error("Firebase desativado temporariamente", err);
+
+    clearTimeout(cloudState.saveTimer);
+    cloudState.saveTimer = 0;
+
+    if (typeof cloudState.unsubscribe === "function") {
+      cloudState.unsubscribe();
+    }
+
+    cloudState.unsubscribe = null;
+    cloudState.docRef = null;
+    cloudState.connected = false;
+    cloudState.applyingRemote = false;
+    cloudState.lastLocalRevision = "";
+    cloudState.lastAppliedRevision = "";
+    updateSyncStatus(message || "Modo local", "warning");
+  }
+
+  function buildCloudPayload() {
+    return {
+      ownerEmail: activeUserEmail || "",
+      profileId: activeUserId || "",
+      revisionId: uid(),
+      updatedAt: Date.now(),
+      data: JSON.parse(JSON.stringify(db)),
+    };
+  }
+
+  function getDbStats(source) {
+    const lists = [
+      Array.isArray(source?.prompts?.items) ? source.prompts.items : [],
+      Array.isArray(source?.clients) ? source.clients : [],
+      Array.isArray(source?.income) ? source.income : [],
+      Array.isArray(source?.incomeExtras) ? source.incomeExtras : [],
+      Array.isArray(source?.passwords) ? source.passwords : [],
+      Array.isArray(source?.programs) ? source.programs : [],
+      Array.isArray(source?.projects) ? source.projects : [],
+      Array.isArray(source?.sites) ? source.sites : [],
+      Array.isArray(source?.tools) ? source.tools : [],
+      Array.isArray(source?.ideas) ? source.ideas : [],
+      Array.isArray(source?.vault) ? source.vault : [],
+      Array.isArray(source?.financeiro?.gastos) ? source.financeiro.gastos : [],
+    ];
+
+    let count = 0;
+    let updatedAt = Number(source?.settings?.lastSavedAt || 0);
+
+    lists.forEach((list) => {
+      count += list.length;
+      list.forEach((item) => {
+        updatedAt = Math.max(updatedAt, Number(item?.updatedAt || item?.createdAt || 0));
+      });
+    });
+
+    return { count, updatedAt };
+  }
+
+  function applyCloudPayload(payload, options = {}) {
+    if (!payload || typeof payload !== "object") return false;
+
+    const revisionId = String(payload.revisionId || "");
+    if (revisionId && (revisionId === cloudState.lastLocalRevision || revisionId === cloudState.lastAppliedRevision)) {
+      return false;
+    }
+
+    cloudState.applyingRemote = true;
+
+    try {
+      db = normalizeDB(payload.data && typeof payload.data === "object" ? payload.data : payload);
+      saveLocalDB();
+      applyTheme(db.settings?.theme || "light");
+      renderNav();
+
+      const preferredSection = options.preserveSection
+        ? uiState.section
+        : db.settings?.lastSection || uiState.section || sections[0]?.id || "prompts";
+
+      uiState.section = getSections().some((section) => section.id === preferredSection)
+        ? preferredSection
+        : sections[0]?.id || "prompts";
+
+      syncNavCurrent();
+      renderSection();
+    } finally {
+      cloudState.applyingRemote = false;
+      cloudState.lastAppliedRevision = revisionId;
+    }
+
+    return true;
+  }
+
+  function saveLocalDB() {
+    if (!storageKey) return;
+
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(db));
+    } catch (err) {
+      console.error("Falha ao salvar DB", err);
+      toast("Falha ao salvar no navegador", "danger");
+    }
+  }
+
+  function queueCloudSave() {
+    if (!cloudState.connected || cloudState.applyingRemote || !cloudState.docRef) return;
+
+    clearTimeout(cloudState.saveTimer);
+    cloudState.saveTimer = setTimeout(() => {
+      persistCloudSaveNow().catch((err) => {
+        fallbackToLocalMode("Modo local. Nao foi possivel salvar no Firebase.", err);
+      });
+    }, 350);
+  }
+
+  async function persistCloudSaveNow() {
+    if (!cloudState.connected || cloudState.applyingRemote || !cloudState.docRef) return;
+
+    const payload = buildCloudPayload();
+    cloudState.lastLocalRevision = payload.revisionId;
+    updateSyncStatus("Sincronizando...", "syncing");
+    await cloudState.dbApi.setDoc(cloudState.docRef, payload, { merge: true });
+    updateSyncStatus("Sincronizado com Firebase", "cloud");
   }
 
   // -------------------------
@@ -918,16 +1442,6 @@
           ).join("")}
         </div>
       `,
-      onMount(modalEl) {
-        modalEl.addEventListener("click", (e) => {
-          const btn = e.target.closest('[data-action="quickAddGo"]');
-          if (!btn) return;
-          const sectionId = btn.dataset.section;
-          closeModal();
-          navigate(sectionId);
-          openAdd(sectionId);
-        });
-      },
     });
   }
 
@@ -959,23 +1473,16 @@
     document.addEventListener("keydown", onKey);
     modal.__cleanup = () => document.removeEventListener("keydown", onKey);
 
-    modal.addEventListener("click", (e) => {
-      const closeBtn = e.target.closest('[data-action="closeModal"]');
-      if (closeBtn) return closeModal();
-
-      const copyBtn = e.target.closest('[data-action="copyField"]');
-      if (copyBtn) return copy(copyBtn.dataset.payload || "");
-
-      const openBtn = e.target.closest('[data-action="openLink"]');
-      if (openBtn) {
-        const url = openBtn.dataset.payload || "";
-        if (url) window.open(url, "_blank", "noopener,noreferrer");
-      }
-    });
-
     el.modalRoot.appendChild(overlay);
     el.modalRoot.appendChild(modal);
-    if (typeof onMount === "function") onMount(modal);
+    if (typeof onMount === "function") {
+      try {
+        onMount(modal);
+      } catch (err) {
+        handleUiError("abrir esta janela", err);
+        closeModal();
+      }
+    }
   }
 
   function closeModal() {
@@ -987,23 +1494,9 @@
   }
 
   function confirmDelete(title, subtitle, onConfirm) {
-    openModal({
-      title,
-      subtitle,
-      body: `
-        <div class="pre">${escapeHTML(subtitle)}</div>
-        <div class="form__footer" style="margin-top: 12px;">
-          <button class="btn btn--ghost" type="button" data-action="closeModal">Cancelar</button>
-          <button class="btn btn--danger" type="button" id="confirmBtn">Excluir</button>
-        </div>
-      `,
-      onMount(modalEl) {
-        $("#confirmBtn", modalEl).addEventListener("click", () => {
-          closeModal();
-          onConfirm();
-        });
-      },
-    });
+    const parts = [title, subtitle].map((value) => String(value || "").trim()).filter(Boolean);
+    const confirmed = window.confirm(parts.join("\n\n") || "Confirmar exclusao?");
+    if (confirmed && typeof onConfirm === "function") onConfirm();
   }
 
   // -------------------------
@@ -1371,19 +1864,25 @@
     }
   }
 
-  function saveDB() {
-    try {
-      localStorage.setItem(storageKey, JSON.stringify(db));
-    } catch (err) {
-      console.error("Falha ao salvar DB", err);
-      toast("Falha ao salvar no navegador", "danger");
+  function saveDB(options = {}) {
+    if (!db.settings || typeof db.settings !== "object") db.settings = {};
+    db.settings.lastSavedAt = Date.now();
+    saveLocalDB();
+    if (options.immediateCloud) {
+      clearTimeout(cloudState.saveTimer);
+      persistCloudSaveNow().catch((err) => {
+        fallbackToLocalMode("Modo local. Nao foi possivel salvar no Firebase.", err);
+      });
+      return;
     }
+
+    queueCloudSave();
   }
 
   function defaultDB() {
     return {
       version: 2,
-      settings: { theme: "light", lastSection: "prompts" },
+      settings: { theme: "light", lastSection: "prompts", lastSavedAt: 0 },
       security: {
         webauthn: { credentialId: "", userId: "", createdAt: 0 },
         master: { salt: "", hash: "", iterations: 150000, createdAt: 0 },
@@ -1402,7 +1901,86 @@
       tools: [],
       ideas: [],
       vault: [],
+      financeiro: defaultFinanceiro(),
     };
+  }
+
+  function currentMonthKey() {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  }
+
+  function defaultFinanceiro(monthKey = currentMonthKey()) {
+    return {
+      monthKey,
+      rendaPrevista: 0,
+      rendaRecebida: 0,
+      metaEconomia: 0,
+      gastos: [],
+    };
+  }
+
+  function normalizeFinanceiro(input) {
+    const base = defaultFinanceiro();
+    const src = input && typeof input === "object" ? input : {};
+
+    const toNum = (v) => {
+      const n = Number(String(v ?? "").replace(",", "."));
+      return Number.isFinite(n) ? n : 0;
+    };
+
+    const gastosSrc = Array.isArray(src.gastos) ? src.gastos : [];
+    const gastos = gastosSrc.map((g) => {
+      const tipo = g?.tipo === "fixo" ? "fixo" : "variavel";
+      return {
+        id: g?.id || uid(),
+        nome: String(g?.nome || "").trim() || "Gasto",
+        valor: Math.max(0, toNum(g?.valor)),
+        tipo,
+        pago: Boolean(g?.pago),
+      };
+    });
+
+    const out = {
+      ...base,
+      ...src,
+      monthKey: /^\d{4}-\d{2}$/.test(String(src.monthKey || "")) ? String(src.monthKey) : base.monthKey,
+      rendaPrevista: Math.max(0, toNum(src.rendaPrevista)),
+      rendaRecebida: Math.max(0, toNum(src.rendaRecebida)),
+      metaEconomia: Math.max(0, toNum(src.metaEconomia)),
+      gastos,
+    };
+
+    applyFinanceMonthlyReset(out);
+    return out;
+  }
+
+  function applyFinanceMonthlyReset(financeiro) {
+    if (!financeiro || typeof financeiro !== "object") return false;
+    const sysMonth = currentMonthKey();
+    if (financeiro.monthKey === sysMonth) return false;
+
+    financeiro.monthKey = sysMonth;
+    financeiro.rendaRecebida = 0;
+    if (Array.isArray(financeiro.gastos)) {
+      financeiro.gastos = financeiro.gastos.map((g) => ({ ...g, pago: false }));
+    } else {
+      financeiro.gastos = [];
+    }
+    return true;
+  }
+
+  function ensureFinanceCurrentMonth() {
+    if (!db || typeof db !== "object") return;
+    if (!db.financeiro || typeof db.financeiro !== "object") db.financeiro = defaultFinanceiro();
+    let changed = applyFinanceMonthlyReset(db.financeiro);
+    // Renda do mês agora é derivada dos clientes; limpa valores manuais antigos.
+    if (Number(db.financeiro.rendaPrevista || 0) !== 0 || Number(db.financeiro.rendaRecebida || 0) !== 0) {
+      db.financeiro.rendaPrevista = 0;
+      db.financeiro.rendaRecebida = 0;
+      changed = true;
+    }
+    if (changed && storageKey) saveDB();
   }
 
   function normalizeDB(input) {
@@ -1413,6 +1991,7 @@
       ...base,
       ...src,
       settings: { ...base.settings, ...(src.settings || {}) },
+      financeiro: normalizeFinanceiro(src.financeiro),
       security: {
         ...base.security,
         ...(src.security && typeof src.security === "object" ? src.security : {}),
@@ -1490,10 +2069,13 @@
 
       return {
         id: c?.id || uid(),
-        name: c?.name || "Sem nome",
+        name: c?.name || c?.nome || "Sem nome",
+        nome: c?.name || c?.nome || "Sem nome",
         company: c?.company || "",
         notes: c?.notes || "",
-        mensality: Number.isFinite(Number(c?.mensality)) ? Number(c.mensality) : 0,
+        valor: Number.isFinite(Number(c?.valor)) ? Number(c.valor) : (Number.isFinite(Number(c?.mensality)) ? Number(c.mensality) : 0),
+        mensality: Number.isFinite(Number(c?.valor)) ? Number(c.valor) : (Number.isFinite(Number(c?.mensality)) ? Number(c.mensality) : 0),
+        ativo: c?.ativo === false ? false : true,
         tags: Array.isArray(c?.tags) ? uniqueStrings(c.tags) : [],
         social: {
           instagram: cred(socialSrc.instagram),
@@ -1655,7 +2237,7 @@
   function sectionCount(sectionId) {
     if (sectionId === "prompts") return db.prompts.items.length;
     if (sectionId === "clients") return db.clients.length;
-    if (sectionId === "income") return db.income.length;
+    if (sectionId === "income") return (db.clients || []).filter((c) => Boolean(c?.ativo)).length;
     if (sectionId === "programs") return db.programs.length;
     if (sectionId === "projects") return db.projects.length;
     if (sectionId === "tools") return db.tools.length;
@@ -1777,17 +2359,6 @@
       })
       .join("");
 
-    el.searchResults.onclick = (e) => {
-      const item = e.target.closest('[data-action="jumpTo"]');
-      if (!item) return;
-      const sectionId = item.dataset.section;
-      const itemId = item.dataset.id;
-      el.searchResults.hidden = true;
-      el.globalSearch.value = "";
-      el.globalSearch.blur();
-      navigate(sectionId);
-      setTimeout(() => openView(sectionId, itemId), 0);
-    };
   }
 
   function uniqueStrings(arr) {
@@ -2125,7 +2696,7 @@
               client.social = client.social || {};
               client.social.others = (client.social.others || []).filter((a) => a.id !== accId);
               client.updatedAt = Date.now();
-              saveDB();
+              saveDB({ immediateCloud: true });
               toast("Registro excluído", "success");
               renderTab("social");
               renderNav();
@@ -2346,6 +2917,7 @@
     const isEdu   = activeUserId === "eduarda";
     const c = existing || ({
       name: "", company: "", notes: "", tags: [],
+      valor: 0, ativo: true,
       address: "", startDate: "", classTime: "", classDays: "",
       social: {
         instagram: { email: "", password: "" },
@@ -2365,6 +2937,21 @@
             <label for="clientName">${isEdu ? "Nome do aluno" : "Nome"}</label>
             <input class="input" id="clientName" name="name" type="text" required value="${escapeAttr(c.name)}"
               placeholder="${isEdu ? "Nome completo do aluno" : "Nome do cliente"}" />
+          </div>
+
+          <div class="row">
+            <div class="field">
+              <label for="clientValor">${isEdu ? "Mensalidade (R$)" : "Valor (R$)"}</label>
+              <input class="input" id="clientValor" name="valor" type="number" min="0" step="0.01"
+                inputmode="decimal" value="${escapeAttr(Number.isFinite(Number(c.valor)) ? Number(c.valor) : (Number(c.mensality) || 0))}" placeholder="Ex: 300" />
+            </div>
+            <div class="field">
+              <label>Status</label>
+              <label style="display:flex; align-items:center; gap:10px; user-select:none; height:40px;">
+                <input type="checkbox" name="ativo" ${c.ativo === false ? "" : "checked"} />
+                <span>${c.ativo === false ? "Inativo" : "Ativo"}</span>
+              </label>
+            </div>
           </div>
 
           ${isEdu ? `
@@ -2446,11 +3033,18 @@
           const fd = new FormData(form);
           const name = String(fd.get("name") || "").trim();
           if (!name) return toast("Nome é obrigatório", "danger");
+          const toNum = (v) => { const n = Number(String(v ?? "").replace(",", ".")); return Number.isFinite(n) ? n : 0; };
+          const valor = Math.max(0, toNum(fd.get("valor")));
+          const ativo = Boolean(fd.get("ativo"));
 
           const keepOthers = (existing?.social?.others || c.social?.others || []).slice();
 
           const payload = isEdu ? {
             name,
+            nome: name,
+            valor,
+            mensality: valor,
+            ativo,
             address:    String(fd.get("address")    || "").trim(),
             startDate:  String(fd.get("startDate")  || "").trim(),
             classTime:  String(fd.get("classTime")  || "").trim(),
@@ -2461,6 +3055,10 @@
             updatedAt: Date.now(),
           } : {
             name,
+            nome: name,
+            valor,
+            mensality: valor,
+            ativo,
             company: String(fd.get("company") || "").trim(),
             notes:   String(fd.get("notes")   || "").trim(),
             tags:    parseTags(String(fd.get("tags") || "")),
@@ -2483,7 +3081,10 @@
 
           saveDB();
           closeModal();
-          renderSection();
+          const backTo = String(uiState.afterClientSaveSection || "");
+          uiState.afterClientSaveSection = "";
+          if (backTo) navigate(backTo);
+          else renderSection();
           toast(isEdit ? (isEdu ? "Aluno atualizado" : "Cliente atualizado") : (isEdu ? "Aluno cadastrado" : "Cliente adicionado"), "success");
         });
       },
@@ -2491,11 +3092,307 @@
   }
 
   function renderIncome() {
-    if (activeUserId === "eduarda") return renderIncomeEdu();
-    return renderIncomeJoao();
+    const financePanel = renderFinanceiroPanel();
+    return financePanel + renderIncomeFromClients();
   }
 
   // ── João: controle financeiro por cliente, mesmo modelo da Eduarda ──
+  function clientValor(c) {
+    const raw = Number.isFinite(Number(c?.valor)) ? Number(c.valor) : Number(c?.mensality);
+    const v = Number(raw);
+    return Number.isFinite(v) ? Math.max(0, v) : 0;
+  }
+
+  function calcRendaClientes() {
+    return (db.clients || [])
+      .filter((c) => Boolean(c?.ativo))
+      .reduce((acc, c) => acc + clientValor(c), 0);
+  }
+
+  function renderIncomeFromClients() {
+    const clients = (db.clients || []).slice().sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "pt-BR"));
+    const ativos = clients.filter((c) => Boolean(c?.ativo));
+    const inativos = clients.filter((c) => !Boolean(c?.ativo));
+    const total = ativos.reduce((acc, c) => acc + clientValor(c), 0);
+
+    const stats = `
+      <div class="stats">
+        <div class="stat">
+          <div class="stat__label">Renda do mês (clientes ativos)</div>
+          <div class="stat__value">${escapeHTML(formatMoney(total))}</div>
+        </div>
+        <div class="stat">
+          <div class="stat__label">Clientes ativos</div>
+          <div class="stat__value">${escapeHTML(String(ativos.length))}</div>
+        </div>
+        <div class="stat">
+          <div class="stat__label">Clientes inativos</div>
+          <div class="stat__value">${escapeHTML(String(inativos.length))}</div>
+        </div>
+      </div>
+    `;
+
+    const cards = clients.length
+      ? `<div class="grid income-cards">
+          ${clients.map((c) => {
+            const ativo = Boolean(c?.ativo);
+            const valor = clientValor(c);
+            const statusBadge = ativo
+              ? `<span class="chip" style="background:var(--success-bg,#dcfce7);color:var(--success,#16a34a);font-weight:700;">Ativo</span>`
+              : `<span class="chip" style="background:var(--warning-bg,#fef9c3);color:var(--warning-text,#a16207);font-weight:700;">Inativo</span>`;
+
+            return `
+              <article class="card income-client-card" style="cursor:default;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                  <h3 class="card__title" style="margin:0;">${escapeHTML(c.name || "Sem nome")}</h3>
+                  ${statusBadge}
+                </div>
+                <div class="card__meta" style="margin-top:8px;">
+                  <span class="chip chip--primary">${escapeHTML(formatMoney(valor))}</span>
+                </div>
+                <div class="card__footer" style="margin-top:10px;">
+                  <span></span>
+                  <span class="chips">
+                    <button class="btn" type="button" data-action="toggleClientActive" data-id="${escapeAttr(c.id)}">${ativo ? "Desativar" : "Ativar"}</button>
+                    <button class="btn" type="button" data-action="editClientFromIncome" data-id="${escapeAttr(c.id)}">Editar</button>
+                    <button class="btn btn--danger" type="button" data-action="deleteClientFromIncome" data-id="${escapeAttr(c.id)}">Excluir</button>
+                  </span>
+                </div>
+              </article>
+            `;
+          }).join("")}
+        </div>`
+      : emptyState("Nenhum cliente cadastrado.", "Adicione um cliente para a renda aparecer automaticamente.");
+
+    return `
+      ${stats}
+      ${cards}
+      <button class="fab" type="button" data-action="incomeAddClient" aria-label="Adicionar cliente">+ Cliente</button>
+    `;
+  }
+
+  function getFinanceiro() {
+    if (!db.financeiro || typeof db.financeiro !== "object") db.financeiro = defaultFinanceiro();
+    db.financeiro = normalizeFinanceiro(db.financeiro);
+    return db.financeiro;
+  }
+
+  function calcFinanceiroTotals(fin) {
+    const metaEconomia = Number(fin?.metaEconomia || 0);
+    const gastosPagos = Array.isArray(fin?.gastos)
+      ? fin.gastos.reduce((acc, g) => acc + (g?.pago ? (Number(g?.valor) || 0) : 0), 0)
+      : 0;
+
+    const totalRecebido = calcRendaClientes();
+    const totalGasto = Number.isFinite(gastosPagos) ? gastosPagos : 0;
+    const saldoAtual = totalRecebido - totalGasto;
+    const valorDisponivel = totalRecebido - (Number.isFinite(metaEconomia) ? metaEconomia : 0) - totalGasto;
+
+    return { totalRecebido, totalGasto, saldoAtual, valorDisponivel };
+  }
+
+  function renderFinanceiroPanel() {
+    const fin = getFinanceiro();
+    const totals = calcFinanceiroTotals(fin);
+
+    const spendingLimit = Math.max(0, totals.totalRecebido - (Number(fin.metaEconomia) || 0));
+    const usedPct = spendingLimit > 0 ? Math.min(100, Math.max(0, (totals.totalGasto / spendingLimit) * 100)) : 0;
+    const overBudget = spendingLimit > 0 ? totals.totalGasto > spendingLimit : totals.totalGasto > 0;
+
+    const gastos = Array.isArray(fin.gastos) ? fin.gastos.slice() : [];
+    gastos.sort((a, b) => (a.pago === b.pago ? String(a.nome).localeCompare(String(b.nome), "pt-BR") : a.pago ? 1 : -1));
+
+    const gastosHtml = gastos.length
+      ? `
+        <div class="finance__list">
+          ${gastos.map((g) => `
+            <div class="finance__row">
+              <label class="finance__check">
+                <input type="checkbox" ${g.pago ? "checked" : ""} data-action="financeTogglePaid" data-id="${escapeAttr(g.id)}" />
+                <span class="finance__name">${escapeHTML(g.nome)}</span>
+              </label>
+              <span class="chip ${g.tipo === "fixo" ? "chip--primary" : ""}">${escapeHTML(g.tipo)}</span>
+              <span class="mono finance__value">${escapeHTML(formatMoney(g.valor))}</span>
+              <span class="chips">
+                <button class="btn" type="button" data-action="financeEditExpense" data-id="${escapeAttr(g.id)}">Editar</button>
+                <button class="btn btn--danger" type="button" data-action="financeDeleteExpense" data-id="${escapeAttr(g.id)}">Excluir</button>
+              </span>
+            </div>
+          `).join("")}
+        </div>
+      `
+      : `<div class="muted" style="padding:8px 0; font-size:13px;">Nenhum gasto cadastrado ainda.</div>`;
+
+    return `
+      <div class="card finance" style="cursor:default; margin-bottom:16px;">
+        <div class="finance__head">
+          <div>
+            <div class="finance__title">Controle financeiro do mes</div>
+            <div class="muted" style="font-size:12px;">Mes: ${escapeHTML(formatMonthKey(fin.monthKey || currentMonthKey()))}</div>
+          </div>
+          <div class="chips">
+            <button class="btn" type="button" data-action="financeSettings">Configurar</button>
+            <button class="btn" type="button" data-action="financeAddExpense">+ Gasto</button>
+          </div>
+        </div>
+
+        <div class="stats" style="margin-top:12px;">
+          <div class="stat">
+            <div class="stat__label">Renda do mes (clientes ativos)</div>
+            <div class="stat__value">${escapeHTML(formatMoney(totals.totalRecebido))}</div>
+          </div>
+          <div class="stat">
+            <div class="stat__label">Total gasto (pagos)</div>
+            <div class="stat__value" style="color:var(--warning,#f59e0b)">${escapeHTML(formatMoney(totals.totalGasto))}</div>
+          </div>
+          <div class="stat">
+            <div class="stat__label">Saldo atual</div>
+            <div class="stat__value">${escapeHTML(formatMoney(totals.saldoAtual))}</div>
+            ${fin.metaEconomia ? `<div class="stat__sub">Meta economia: ${escapeHTML(formatMoney(fin.metaEconomia))}</div>` : ""}
+          </div>
+          <div class="stat">
+            <div class="stat__label">Quanto ainda pode gastar</div>
+            <div class="stat__value" style="color:${totals.valorDisponivel >= 0 ? "var(--success,#22c55e)" : "var(--danger,#ef4444)"}">
+              ${escapeHTML(formatMoney(totals.valorDisponivel))}
+            </div>
+          </div>
+        </div>
+
+        <div class="finance__progress">
+          <div class="finance__progress-head">
+            <span class="muted" style="font-size:12px;">
+              Limite de gastos: ${escapeHTML(formatMoney(spendingLimit))} • Usado: ${escapeHTML(formatMoney(totals.totalGasto))}
+            </span>
+            <span class="mono" style="font-size:12px;">${escapeHTML(formatNumber(usedPct))}%</span>
+          </div>
+          <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeAttr(usedPct)}">
+            <div class="progress__bar ${overBudget ? "is-over" : ""}" style="width:${escapeAttr(usedPct)}%"></div>
+          </div>
+        </div>
+
+        <div class="finance__section">
+          <div class="finance__section-title">Gastos (fixos e variaveis)</div>
+          ${gastosHtml}
+        </div>
+      </div>
+    `;
+  }
+
+  function openFinanceSettingsModal() {
+    const fin = getFinanceiro();
+    openModal({
+      title: "Configurar financeiro",
+      subtitle: "A renda do mes vem automaticamente dos clientes ativos. Aqui voce define apenas sua meta de economia.",
+      body: `
+        <form class="form" id="financeSettingsForm">
+          <div class="field">
+            <label for="finMeta">Meta de economia</label>
+            <input class="input" id="finMeta" name="metaEconomia" type="number" min="0" step="0.01"
+              inputmode="decimal" value="${escapeAttr(fin.metaEconomia || 0)}" placeholder="Ex: 800" />
+          </div>
+          <div class="form__footer">
+            <button class="btn btn--ghost" type="button" data-action="closeModal">Cancelar</button>
+            <button class="btn btn--primary" type="submit">Salvar</button>
+          </div>
+        </form>
+      `,
+      onMount(modalEl) {
+        const form = $("#financeSettingsForm", modalEl);
+        const toNum = (v) => {
+          const n = Number(String(v ?? "").replace(",", "."));
+          return Number.isFinite(n) ? n : 0;
+        };
+        form.addEventListener("submit", (e) => {
+          e.preventDefault();
+          const fd = new FormData(form);
+          fin.metaEconomia = Math.max(0, toNum(fd.get("metaEconomia")));
+          db.financeiro = fin;
+          saveDB();
+          closeModal();
+          renderSection();
+          toast("Configuracoes salvas", "success");
+        });
+      },
+    });
+  }
+
+  function openFinanceExpenseModal(existing) {
+    const fin = getFinanceiro();
+    const isEdit = Boolean(existing);
+    const g = existing || { id: "", nome: "", valor: "", tipo: "variavel", pago: false };
+
+    openModal({
+      title: isEdit ? "Editar gasto" : "Adicionar gasto",
+      subtitle: "Cadastre gasto fixo ou variavel e marque como pago quando quitar.",
+      body: `
+        <form class="form" id="financeExpenseForm">
+          <div class="field">
+            <label for="finNome">Nome</label>
+            <input class="input" id="finNome" name="nome" type="text" required value="${escapeAttr(g.nome || "")}" placeholder="Ex: Internet, Mercado, Aluguel..." />
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="finValor">Valor (R$)</label>
+              <input class="input" id="finValor" name="valor" type="number" min="0" step="0.01"
+                inputmode="decimal" required value="${escapeAttr(g.valor)}" placeholder="Ex: 250" />
+            </div>
+            <div class="field">
+              <label for="finTipo">Tipo</label>
+              <select class="select" id="finTipo" name="tipo">
+                <option value="fixo" ${g.tipo === "fixo" ? "selected" : ""}>fixo</option>
+                <option value="variavel" ${g.tipo !== "fixo" ? "selected" : ""}>variavel</option>
+              </select>
+            </div>
+          </div>
+          <div class="field" style="margin-top:2px;">
+            <label style="display:flex; align-items:center; gap:10px; user-select:none;">
+              <input type="checkbox" name="pago" ${g.pago ? "checked" : ""} />
+              <span>Ja esta pago</span>
+            </label>
+          </div>
+          <div class="form__footer">
+            <button class="btn btn--ghost" type="button" data-action="closeModal">Cancelar</button>
+            <button class="btn btn--primary" type="submit">${isEdit ? "Salvar" : "Adicionar"}</button>
+          </div>
+        </form>
+      `,
+      onMount(modalEl) {
+        const form = $("#financeExpenseForm", modalEl);
+        const toNum = (v) => {
+          const n = Number(String(v ?? "").replace(",", "."));
+          return Number.isFinite(n) ? n : 0;
+        };
+        form.addEventListener("submit", (e) => {
+          e.preventDefault();
+          const fd = new FormData(form);
+          const nome = String(fd.get("nome") || "").trim();
+          const valor = Math.max(0, toNum(fd.get("valor")));
+          const tipo = String(fd.get("tipo") || "variavel") === "fixo" ? "fixo" : "variavel";
+          const pago = Boolean(fd.get("pago"));
+
+          if (!nome) return toast("Nome e obrigatorio", "danger");
+          if (!(valor > 0)) return toast("Informe um valor valido", "danger");
+
+          const payload = { nome, valor, tipo, pago };
+          fin.gastos = Array.isArray(fin.gastos) ? fin.gastos : [];
+
+          if (isEdit) {
+            const idx = fin.gastos.findIndex((x) => x.id === existing.id);
+            if (idx >= 0) fin.gastos[idx] = { ...fin.gastos[idx], ...payload };
+          } else {
+            fin.gastos.push({ id: uid(), ...payload });
+          }
+
+          db.financeiro = fin;
+          saveDB();
+          closeModal();
+          renderSection();
+          toast(isEdit ? "Gasto atualizado" : "Gasto adicionado", "success");
+        });
+      },
+    });
+  }
+
   function renderIncomeJoao() {
     const now = new Date();
     const currentMonthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
@@ -2789,7 +3686,7 @@
           if (delBtn) {
             confirmDelete("Excluir pagamento?", "Essa ação não pode ser desfeita.", () => {
               db.income = db.income.filter((x) => x.id !== delBtn.dataset.id);
-              saveDB();
+              saveDB({ immediateCloud: true });
               renderSection();
               openIncomeClientModal(clientId);
             });
